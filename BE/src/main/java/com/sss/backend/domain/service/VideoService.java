@@ -258,6 +258,14 @@ public class VideoService {
             // 오디오 파일 복사 (필수 과정)
             Files.copy(Paths.get(audioPath), Paths.get(cleanAudioPath), StandardCopyOption.REPLACE_EXISTING);
 
+            // 오디오 길이 확인 (자막 표시 시간을 결정하기 위해)
+            double audioDurationSeconds = getAudioDuration(cleanAudioPath);
+            
+            if (audioDurationSeconds <= 0) {
+                logger.warn("오디오 길이를 확인할 수 없어 기본값 3초를 사용합니다.");
+                audioDurationSeconds = 3.0;
+            }
+
             // S3 pre-signed URL 생성
             String imageS3Key = s3Config.extractS3KeyFromUrl(imageUrl);
             String presignedImageUrl = s3Config.generatePresignedUrl(imageS3Key);
@@ -269,9 +277,6 @@ public class VideoService {
                 logger.info("배경 이미지 사용: {}", backgroundImageFilePath);
 
                 // 배경 이미지와 메인 이미지를 한 번에 처리
-                // 1. 배경 이미지 입력
-                // 2. S3 이미지 URL 입력
-                // 3. filter_complex로 이미지 리사이즈 및 오버레이
                 FFmpegBuilder builder = new FFmpegBuilder()
                     .addInput(backgroundImageFilePath)
                     .addInput(presignedImageUrl)
@@ -280,11 +285,14 @@ public class VideoService {
                     .addExtraArgs("-protocol_whitelist", "file,http,https,tcp,tls")
                     .addOutput(cleanOutputPath)
                     .addExtraArgs("-filter_complex",
-                        "[1:v]scale=800:800[fg];" +    // 메인 이미지를 800x800으로 조정
-                        "[0:v][fg]overlay=(540-w/2):(1250-h/2)[v];" +  // 이미지 중앙이 (540,1250)에 오도록 배치
+                        "[0:v]loop=loop=-1:size=1:start=0,fps=30,setpts=N/30/TB[bg];" +  // 배경 반복 및 30fps 설정
+                        "[1:v]loop=loop=-1:size=1:start=0,fps=30,scale=800:800,setpts=N/30/TB[fg];" +    // 메인 이미지 반복 및 30fps 설정
+                        "[bg][fg]overlay=(540-w/2):(1250-h/2)[v];" +  // 이미지 중앙이 (540,1250)에 오도록 배치
                         "[v][2:a]concat=n=1:v=1:a=1[outv][outa]")  // 비디오와 오디오 결합
                     .addExtraArgs("-map", "[outv]")
                     .addExtraArgs("-map", "[outa]")
+                    .addExtraArgs("-t", String.format("%.3f", audioDurationSeconds)) // 오디오 길이에 맞춰 영상 길이 설정
+                    .addExtraArgs("-r", "30") // 출력 프레임 레이트 설정
                     .setVideoCodec("libx264")
                     .setConstantRateFactor(23)
                     .setVideoPixelFormat("yuv420p")
@@ -306,10 +314,12 @@ public class VideoService {
                     .addExtraArgs("-protocol_whitelist", "file,http,https,tcp,tls")
                     .addOutput(cleanOutputPath)
                     .addExtraArgs("-filter_complex",
-                        "[0:v]scale=900:900,pad=1080:1920:90:510:white[v];" +  // 900x900으로 조정 및 흰색 패딩
+                        "[0:v]loop=loop=-1:size=1:start=0,fps=30,scale=900:900,setpts=N/30/TB,pad=1080:1920:90:510:white[v];" +  // 반복 및 30fps 설정, 900x900으로 조정 및 흰색 패딩
                         "[v][1:a]concat=n=1:v=1:a=1[outv][outa]")
                     .addExtraArgs("-map", "[outv]")
                     .addExtraArgs("-map", "[outa]")
+                    .addExtraArgs("-t", String.format("%.3f", audioDurationSeconds)) // 오디오 길이에 맞춰 영상 길이 설정
+                    .addExtraArgs("-r", "30") // 출력 프레임 레이트 설정
                     .setVideoCodec("libx264")
                     .setConstantRateFactor(23)
                     .setVideoPixelFormat("yuv420p")
@@ -330,6 +340,28 @@ public class VideoService {
             logger.error("이미지와 오디오 합성 중 오류 발생: {}", e.getMessage(), e);
             throw new RuntimeException("이미지와 오디오 합성 중 오류 발생: " + e.getMessage(), e);
         }
+    }
+
+    // 오디오 파일 길이를 가져오는 헬퍼 메서드
+    private double getAudioDuration(String audioFilePath) {
+        try {
+            String[] ffprobeCmd = {
+                ffmpeg.getPath().replace("ffmpeg", "ffprobe"),
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                audioFilePath
+            };
+            Process process = Runtime.getRuntime().exec(ffprobeCmd);
+            java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(process.getInputStream()));
+            String durationStr = reader.readLine();
+            if (durationStr != null && !durationStr.trim().isEmpty()) {
+                return Double.parseDouble(durationStr);
+            }
+        } catch (Exception e) {
+            logger.warn("오디오 길이 확인 중 오류: {}", e.getMessage());
+        }
+        return 0.0;
     }
     
     public File mergeVideos(List<String> videoPaths, String outputPath, String storyId) {
@@ -387,6 +419,8 @@ public class VideoService {
                 .addExtraArgs("-f", "concat")
                 .addExtraArgs("-safe", "0")
                 .addOutput(cleanTempOutputPath)
+                .addExtraArgs("-af", "apad=pad_dur=1")
+                .addExtraArgs("-r", "30") // 출력 프레임 레이트 설정
                 .setVideoCodec("libx264")
                 .setConstantRateFactor(23) // 품질 설정 (0-51, 낮을수록 고품질)
                 .setVideoPixelFormat("yuv420p") // 유튜브 호환 픽셀 포맷
@@ -434,16 +468,18 @@ public class VideoService {
                 subtitleFile = createSubtitleFile(storyId);
                 tempFilesToDelete.add(subtitleFile.getAbsolutePath());
                 
+                // 영상에 자막을 추가할 때 프레임 레이트를 명시적으로 지정하여 자막이 제대로 갱신되도록 함
                 FFmpegBuilder subtitleBuilder = new FFmpegBuilder()
                     .setInput(currentVideoPath)
                     .addExtraArgs("-y")
                     .addOutput(cleanOutputPath)
+                    .addExtraArgs("-filter_complex", "fps=30[v];[v]ass=" + subtitleFile.getAbsolutePath().replace("\\", "\\\\").replace(":", "\\:")) // 프레임 레이트 필터 추가 후 자막 적용
+                    .addExtraArgs("-r", "30") // 출력 프레임 레이트 설정
                     .setVideoCodec("libx264")
                     .setConstantRateFactor(23) // 품질 설정
                     .setVideoPixelFormat("yuv420p") // 유튜브 호환 픽셀 포맷
                     .setAudioCodec("aac")
                     .setAudioBitRate(128000) // 128kbps
-                    .addExtraArgs("-vf", "ass=" + subtitleFile.getAbsolutePath().replace("\\", "\\\\").replace(":", "\\:"))
                     .setFormat("mp4")
                     .done();
                     
@@ -464,6 +500,7 @@ public class VideoService {
                             "[0:a][a1]amerge=inputs=2[aout]")  // amix 대신 amerge 사용
                         .addExtraArgs("-map", "0:v")
                         .addExtraArgs("-map", "[aout]")
+                        .addExtraArgs("-r", "30") // 출력 프레임 레이트 설정
                         .setVideoCodec("copy")
                         .setAudioCodec("aac")
                         .setAudioBitRate(192000)
@@ -893,11 +930,13 @@ public class VideoService {
 
         // 자막 시간 추적을 위한 변수 초기화
         double currentTime = 0.0;
-         
+        double prevEndTime = 0.0;
+        
         for (Map<String, Object> scene : scenes) {
             List<Map<String, Object>> audioArr = (List<Map<String, Object>>) scene.get("audioArr");
             
-            for (Map<String, Object> audio : audioArr) {
+            for (int i = 0; i < audioArr.size(); i++) {
+                Map<String, Object> audio = audioArr.get(i);
                 // 텍스트와 길이 가져오기
                 String text = (String) audio.get("text");
                 
@@ -914,6 +953,17 @@ public class VideoService {
                 double duration = audio.containsKey("duration") ? 
                     ((Number) audio.get("duration")).doubleValue() : 3.0; // 기본값 3초
                 
+                // 마지막 오디오인 경우 1초 추가
+                boolean isLastAudio = (i == audioArr.size() - 1);
+                if (isLastAudio) {
+                    duration += 1.0;
+                }
+                
+                // 이전 자막과의 간격 확인 및 조정
+                if (currentTime < prevEndTime) {
+                    currentTime = prevEndTime;
+                }
+                
                 // ASS 형식의 시간 문자열
                 String startTime = formatAssTime(currentTime);
                 String endTime = formatAssTime(currentTime + duration);
@@ -926,7 +976,8 @@ public class VideoService {
                          .append(text)
                          .append("\n");
                 
-                // 현재 시간 업데이트
+                // 자막 타이밍 업데이트
+                prevEndTime = currentTime + duration;
                 currentTime += duration;
             }
         }
